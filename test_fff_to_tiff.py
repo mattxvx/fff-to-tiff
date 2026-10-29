@@ -9,7 +9,7 @@ import fff_to_tiff
 
 
 def _make_synthetic_fff(path: Path, byteorder: str = '>', dpi: int = 3200) -> np.ndarray:
-    """Crea un file .fff sintetico con tag privati Imacon/FlexColor per i test."""
+    """Create a synthetic .fff file with Imacon/FlexColor private tags for testing."""
     pixels = np.arange(16 * 16 * 3, dtype=byteorder + 'u2').reshape(16, 16, 3)
     plist_bytes = plistlib.dumps({
         'CurrentIx': 0,
@@ -34,7 +34,7 @@ def _make_synthetic_fff(path: Path, byteorder: str = '>', dpi: int = 3200) -> np
 
 
 def test_end_to_end_lossless_conversion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifica conversione lossless, estrazione DPI dal plist e preservazione tag."""
+    """Verify lossless conversion, DPI extraction from plist, and tag preservation."""
     src = tmp_path / "scan.fff"
     dst = tmp_path / "out.tif"
     expected_pixels = _make_synthetic_fff(src, byteorder='>', dpi=2040)
@@ -50,7 +50,7 @@ def test_end_to_end_lossless_conversion(tmp_path: Path, monkeypatch: pytest.Monk
 
 
 def test_refuses_to_overwrite_source_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifica che --force non permetta di sovrascrivere il file sorgente."""
+    """Verify that --force refuses to overwrite the source file."""
     src = tmp_path / "scan.fff"
     _make_synthetic_fff(src)
 
@@ -60,21 +60,21 @@ def test_refuses_to_overwrite_source_file(tmp_path: Path, monkeypatch: pytest.Mo
 
 
 def test_truncated_file_raises_value_error(tmp_path: Path) -> None:
-    """Verifica che un file TIFF troncato sollevi ValueError anziché struct.error."""
+    """Verify that a truncated TIFF file raises ValueError instead of struct.error."""
     bad = tmp_path / "truncated.fff"
-    bad.write_bytes(b"MM\x00*\x00\x00\x00\x10")  # Offset IFD punta oltre EOF
+    bad.write_bytes(b"MM\x00*\x00\x00\x00\x10")  # IFD offset points past EOF
     with pytest.raises(ValueError, match="unexpected EOF"):
         fff_to_tiff.read_ifd0(str(bad))
 
 
 def test_corrupt_flexcolor_plist_falls_back_gracefully() -> None:
-    """Verifica che un tag 50457 corrotto o troncato restituisca None senza crash."""
-    tags = {50457: (7, 2, b"\x00\x01")}  # Meno di 4 byte
+    """Verify that a corrupt or truncated tag 50457 returns None gracefully without crashing."""
+    tags = {50457: (7, 2, b"\x00\x01")}  # Fewer than 4 bytes
     assert fff_to_tiff.flexcolor_settings(tags) is None
 
 
 def test_little_endian_conversion(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifica che il calcolo MD5 e la conversione funzionino anche su TIFF little-endian ('<')."""
+    """Verify that MD5 calculation and conversion work on little-endian ('<') TIFF files."""
     src = tmp_path / "scan_le.fff"
     dst = tmp_path / "out_le.tif"
     expected_pixels = _make_synthetic_fff(src, byteorder='<', dpi=1600)
@@ -89,7 +89,7 @@ def test_little_endian_conversion(tmp_path: Path, monkeypatch: pytest.MonkeyPatc
 
 
 def test_partial_file_cleaned_up_on_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    """Verifica che il file .partial venga rimosso se la scrittura o la verifica fallisce."""
+    """Verify that the temporary .partial file is removed if writing or verification fails."""
     src = tmp_path / "scan.fff"
     dst = tmp_path / "out.tif"
     _make_synthetic_fff(src)

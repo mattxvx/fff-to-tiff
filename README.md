@@ -1,119 +1,119 @@
-# Hasselblad / Imacon Flextight X5: Analisi FFF e Conversione Lossless in TIFF
+# Hasselblad / Imacon Flextight X5: FFF Analysis and Lossless TIFF Conversion
 
-Questo archivio documenta l'analisi tecnica dei file proprietari **.fff** (3F - *Flexible File Format*) generati dallo scanner a tamburo virtuale **Hasselblad / Imacon Flextight X5** per negativi 4x5, e fornisce gli strumenti per la loro **archiviazione lossless standard** e l'estrazione della resa positiva sviluppata con Hasselblad FlexColor.
+This repository documents the technical analysis of proprietary **.fff** (3F – *Flexible File Format*) files produced by the **Hasselblad / Imacon Flextight X5** virtual drum scanner for 4x5 negatives. It provides tools for their **standard lossless archiving** and for extracting the developed positive rendering from Hasselblad FlexColor.
 
 ---
 
-## 1. Anatomia del formato .fff (Hasselblad 3F)
+## 1. Anatomy of the .fff Format (Hasselblad 3F)
 
-L'analisi a basso livello del file `.fff` evidenzia che si tratta internamente di un container standard **TIFF Big-Endian (`MM`, Magic 42)** con la seguente architettura:
+Low-level inspection of the `.fff` file reveals that it is internally a standard **Big-Endian TIFF (`MM`, Magic 42)** container with the following architecture:
 
-### Immagine Principale (IFD #0)
-- **Risoluzione:** ad es. 7991 × 10120 pixel (~80,8 Megapixel a 2040 ppi per formato 4x5).
-- **Spazio colore:** RGB a 3 canali (anche per pellicole bianco e nero).
-- **Profondità colore:** 16 bit per canale (campioni memorizzati come interi senza segno `>u2`).
-- **Dinamica effettiva del sensore:** **14 bit nativi** estesi su 16 bit (tutti i valori sono multipli esatti di 4, i 2 bit meno significativi sono sempre a `0`).
-- **Dati grezzi:** Immagine **negativa non invertita**, senza alcuna compressione (un unico strip continuo di byte = W × H × 3 × 2).
-- **Multi-canale nei negativi B&W:** I canali R, G e B registrano risposte leggermente diverse del sensore CCD a 3 linee (scostamento medio di ~250–280 livelli tra canali). Convertire direttamente il file sorgente in scala di grigi causerebbe una perdita di informazione nativa; la copia master deve quindi rimanere RGB a 3 canali.
+### Primary Image (IFD #0)
+- **Resolution:** e.g., 7991 × 10120 pixels (~80.8 megapixels at 2040 ppi for 4x5 format).
+- **Color space:** 3-channel RGB (even for black-and-white film).
+- **Bit depth:** 16 bits per channel (samples stored as unsigned big-endian integers `>u2`).
+- **Effective sensor dynamic range:** **14 native bits** padded to 16 bits (all values are exact multiples of 4; the 2 least significant bits are always `0`).
+- **Raw payload:** **Uninverted negative** image data without any compression (a single continuous byte strip = W × H × 3 × 2).
+- **Multi-channel data in B&W negatives:** Channels R, G, and B record slight variations from the 3-line trilinear CCD sensor (mean deviation of ~250–280 levels across channels). Directly converting the source to grayscale would discard native sensor information; the archival master must therefore remain 3-channel RGB.
 
-### Metadati e Tag Proprietari Hasselblad/Imacon
-I parametri di sviluppo di FlexColor **non alterano i pixel grezzi**, ma vengono salvati come ricette all'interno di tag TIFF privati:
+### Hasselblad / Imacon Proprietary Tags and Metadata
+FlexColor development parameters **do not alter the raw sensor pixels**; instead, they are recorded as non-destructive recipes within private TIFF tags:
 
-| Tag / Directory | Nome | Descrizione |
+| Tag / Directory | Name | Description |
 |---|---|---|
-| `33723` | **IPTC** | Metadati IPTC standard (credit/autore, data e ora di scansione, caption/titolo, ecc.). |
-| `34152` | **IPTC Copy** | Copia secondaria del blocco IPTC gestita da Imacon. |
-| `34377` | **Photoshop IRB** | Risorse immagine Photoshop (8BIM) contenenti IPTC e risoluzione. |
-| `46277` | **Imacon Scan Info** | Informazioni hardware, calibrazione e profili target. |
-| `46279` | **Imacon Scanner ID** | Versione software FlexColor e numero di serie dell'hardware scanner. |
-| `50457` | **FlexColor Plist** | XML Apple Property List contenente **tutti i set di regolazioni**: curve di gradazione, istogramma, rimozione dominante, rotazione (90°), crop e profili colore. |
-| `50458` | **Imacon RGB Thumb** | Thumbnail preview RGB a 8 bit incorporata. |
-| *(Directory esterne)* | **IFD #1 / #2** | Sub-IFD concatenati in coda al file `.fff` originale contenenti anteprime ridotte (8 bit e 16 bit). Non vengono replicati nel master TIFF in quanto ridondanti (la miniatura originale è già preservata nel tag `50458`). |
+| `33723` | **IPTC** | Standard IPTC metadata (byline/author, scan date/time, caption/title, etc.). |
+| `34152` | **IPTC Copy** | Secondary copy of the IPTC block managed by Imacon. |
+| `34377` | **Photoshop IRB** | Photoshop Image Resource Blocks (8BIM) containing IPTC and resolution data. |
+| `46277` | **Imacon Scan Info** | Hardware scanner info, calibration, and target profiles. |
+| `46279` | **Imacon Scanner ID** | FlexColor software version and scanner hardware serial number. |
+| `50457` | **FlexColor Plist** | Apple Property List (XML) containing **all adjustment sets**: gradation curves, histogram, color cast removal, rotation (90°), crop, and color profiles. |
+| `50458` | **Imacon RGB Thumb** | Embedded 8-bit RGB preview thumbnail. |
+| *(External Directories)* | **IFD #1 / #2** | Sub-IFDs appended to the tail of the original `.fff` file containing downscaled preview thumbnails (8-bit and 16-bit). These are not replicated in the master TIFF as they are redundant (the original thumbnail is already preserved in tag `50458`). |
 
 ---
 
-## 2. Strategia di Archiviazione: Master vs Positivo di Lavoro
+## 2. Archival Strategy: Archival Master vs. Working Positive
 
-Una corretta conservazione digitale richiede di separare la componente **master d'archivio** dalla componente **positivata/interpretata**:
+Proper digital preservation requires decoupling the **archival master** from the **rendered / interpreted positive**:
 
 ```mermaid
 flowchart TD
-    FFF["File Scansione Originale (.fff)<br/>Sensore RAW (Negativo RGB 16-bit)"]
+    FFF["Original Scan File (.fff)<br/>RAW Sensor Data (16-bit RGB Negative)"]
     
-    FFF -->|"fff_to_tiff.py (Bit-for-bit, ZIP)"| Master["TIFF Negativo Master (*_negative_master.tif)<br/>- 16-bit RGB Lossless<br/>- Risoluzione reale da metadati (es. 2040 ppi)<br/>- Tag privati & FlexColor Plist inclusi<br/>- Metadati standard Make/Model/DateTime/MD5<br/>- Verifica MD5 bit-a-bit identica"]
-    FFF -->|"Hasselblad FlexColor (Export)"| Positive["TIFF Positivo di Lavoro (*.tif)<br/>- 16-bit Scala di Grigi<br/>- Curva pellicola, crop e rotazione applicati<br/>- Pronto per stampa e fotoritocco"]
+    FFF -->|"fff_to_tiff.py (Bit-for-bit, ZIP)"| Master["Archival Negative TIFF (*_negative_master.tif)<br/>- 16-bit Lossless RGB<br/>- True resolution from metadata (e.g., 2040 ppi)<br/>- Private tags & FlexColor Plist preserved<br/>- Standard Make/Model/DateTime/MD5 tags<br/>- Verified bit-for-bit identical via MD5"]
+    FFF -->|"Hasselblad FlexColor (Export)"| Positive["Working Positive TIFF (*.tif)<br/>- 16-bit Grayscale<br/>- Film curve, crop, and rotation applied<br/>- Ready for printing and retouching"]
 ```
 
-1. **TIFF Negativo Master (`*_negative_master.tif`)**:
-   - **Lossless al 100%:** I pixel grezzi 16-bit RGB vengono copiati byte per byte senza modifiche.
-   - **Compressione senza perdita (Deflate/ZIP + Horizontal Predictor):** Riduce le dimensioni del file di circa il 25–30% mantenendo intatta la corrispondenza bit-a-bit.
-   - **Compatibilità a lungo termine:** Leggibile da qualsiasi software (Photoshop, Lightroom, RawTherapee, Negative Lab Pro) anche se l'ambiente FlexColor non dovesse più essere accessibile in futuro.
-   - **Metadati standard compilati automaticamente:**
-     - `ImageDescription` (tag 270): documenta il nome del file sorgente, l'impronta MD5 esatta dei pixel grezzi, i ppi effettivi, il nome del set di regolazioni FlexColor attivo e il timestamp ISO di conversione.
+1. **Archival Negative TIFF (`*_negative_master.tif`)**:
+   - **100% Lossless:** Raw 16-bit RGB pixel data is copied byte-for-byte without any alteration.
+   - **Lossless Compression (Deflate/ZIP + Horizontal Predictor):** Reduces file size by approximately 25–30% while preserving strict bit-for-bit integrity.
+   - **Long-term Compatibility:** Open and editable in any standard imaging software (Photoshop, Lightroom, RawTherapee, Negative Lab Pro), even if the FlexColor runtime environment becomes obsolete.
+   - **Standard Metadata Automatically Populated:**
+     - `ImageDescription` (tag 270): Records source filename, exact raw pixel MD5 checksum, effective ppi, active FlexColor setup name, and ISO conversion timestamp.
      - `Make` (tag 271): `Hasselblad`.
      - `Model` (tag 272): `Flextight X5`.
-     - `DateTime` (tag 306): data e ora originali di scansione estratte dai record IPTC `2:55` e `2:60`/`2:56`.
-   - **Tag privati preservati:** Copia integrale dei blocchi Imacon/FlexColor inclusa la plist `50457` con tutta la cronologia dei settaggi.
+     - `DateTime` (tag 306): Original scan timestamp extracted from IPTC records `2:55` and `2:60`/`2:56`.
+   - **Preserved Private Tags:** Complete byte-for-byte copy of Imacon/FlexColor blocks, including the plist `50457` holding the complete adjustment history.
 
-2. **TIFF Positivo di Lavoro (`*.tif`)**:
-   - Esportato direttamente tramite **FlexColor**.
-   - Formato **16-bit Grayscale** (massima dinamica tonale continua senza posterizzazione).
-   - Inversione colore, rotazione, crop dell'inquadratura e curva di contrasto personalizzata già renderizzati.
+2. **Working Positive TIFF (`*.tif`)**:
+   - Exported directly via **FlexColor**.
+   - **16-bit Grayscale** format (maximum continuous tonal range without banding/posterization).
+   - Color inversion, rotation, framing crop, and custom contrast curve fully rendered.
 
 ---
 
-## 3. Utilizzo dello Script `fff_to_tiff.py`
+## 3. Using the `fff_to_tiff.py` Script
 
-Lo script [`fff_to_tiff.py`](fff_to_tiff.py) esegue la conversione automatizzata con verifica di sicurezza.
+The [`fff_to_tiff.py`](fff_to_tiff.py) script automates the conversion process with built-in safety verifications.
 
-### Prerequisiti
-Installare le dipendenze Python richieste:
+### Prerequisites
+Install the required Python dependencies:
 ```powershell
 pip install numpy tifffile imagecodecs pytest
 ```
 
-### Sintassi CLI
+### CLI Syntax
 ```powershell
-# Conversione singola (genera automaticamente NOME_negative_master.tif)
-python fff_to_tiff.py "scansione.fff"
+# Single conversion (automatically generates NAME_negative_master.tif)
+python fff_to_tiff.py "scan.fff"
 
-# Specifica del file di output
-python fff_to_tiff.py "scansione.fff" -o "output_master.tif"
+# Specify a custom output file
+python fff_to_tiff.py "scan.fff" -o "output_master.tif"
 
-# Sovrascrittura controllata di un master esistente
-python fff_to_tiff.py "scansione.fff" -o "output_master.tif" --force
+# Safely overwrite an existing master file
+python fff_to_tiff.py "scan.fff" -o "output_master.tif" --force
 
-# Personalizzazione dell'altezza degli strip compressi (predefinito: 64 righe)
-python fff_to_tiff.py "scansione.fff" --rows-per-strip 128
+# Custom strip height for compression (default: 64 rows)
+python fff_to_tiff.py "scan.fff" --rows-per-strip 128
 ```
 
-### Caratteristiche di Sicurezza Implementate
-- **Protezione anticollisione sorgente:** Impedisce la sovrascrittura accidentale del file `.fff` sorgente anche se passato come destinazione con `--force`.
-- **Verifica post-scrittura a doppio livello:** Rilettura immediata del file TIFF generato, confronto con la matrice numpy sorgente e calcolo del checksum MD5.
-- **Scrittura atomica:** L'immagine viene scritta temporaneamente come `.tif.partial`; se la verifica o la scrittura fallisce per qualsiasi motivo (es. disco pieno o interruzione), il file incompleto viene rimosso immediatamente dal disco.
-- **Supporto multi-piattaforma ed Endianness:** Supporto nativo sia per file Big-Endian (`MM`) che Little-Endian (`II`).
-- **Zero-copy e memoria ottimizzata:** Utilizzo di `memoryview` per l'hashing MD5 e passaggio diretto dei buffer per contenere l'uso della RAM durante l'elaborazione di scansioni di grande formato.
+### Built-in Safety Features
+- **Source Collision Protection:** Prevents accidental overwriting of the source `.fff` file even when specified as the destination with `--force`.
+- **Two-tier Post-write Verification:** Immediately re-reads the output TIFF, compares pixel arrays against the source numpy matrix, and validates MD5 checksums.
+- **Atomic Writing:** The image is written to a temporary `.tif.partial` file; if verification or writing fails for any reason (e.g., out of disk space or process interruption), the incomplete file is cleanly removed.
+- **Cross-platform and Endianness Support:** Native support for both Big-Endian (`MM`) and Little-Endian (`II`) TIFF containers.
+- **Zero-copy and Low Memory Footprint:** Employs `memoryview` for MD5 hashing and direct buffer passing to minimize RAM consumption when processing ultra-high-resolution large-format scans.
 
 ---
 
 ## 4. Test Suite (`pytest`)
 
-I test unitari automatizzati sono disponibili in [`test_fff_to_tiff.py`](test_fff_to_tiff.py):
+Automated unit tests are provided in [`test_fff_to_tiff.py`](test_fff_to_tiff.py):
 
 ```powershell
-pytest -v
+python -m pytest -v
 ```
 
-Casi di test inclusi:
-1. `test_end_to_end_lossless_conversion`: Roundtrip completo, verifica DPI da plist e presenza tag privati.
-2. `test_refuses_to_overwrite_source_file`: Controllo di rifiuto sovrascrittura del sorgente con `--force`.
-3. `test_truncated_file_raises_value_error`: Rilevamento file troncati o offset oltre EOF (`_read_exact`).
-4. `test_corrupt_flexcolor_plist_falls_back_gracefully`: Tolleranza ad anomalie nel plist dei metadati.
-5. `test_little_endian_conversion`: Verifica del flusso little-endian (`<`) e integrità dell'MD5.
-6. `test_partial_file_cleaned_up_on_failure`: Pulizia garantita dei file temporanei `.partial` in caso di eccezioni a runtime.
+Included test cases:
+1. `test_end_to_end_lossless_conversion`: Full round-trip verification, DPI extraction from plist, and private tag preservation.
+2. `test_refuses_to_overwrite_source_file`: Confirms `--force` cannot overwrite the source `.fff` file.
+3. `test_truncated_file_raises_value_error`: Detection of truncated files or out-of-bounds offsets (`_read_exact`).
+4. `test_corrupt_flexcolor_plist_falls_back_gracefully`: Graceful degradation if metadata plist is malformed.
+5. `test_little_endian_conversion`: Validates little-endian (`<`) byte order handling and MD5 integrity.
+6. `test_partial_file_cleaned_up_on_failure`: Ensures incomplete `.partial` files are deleted on runtime exceptions.
 
 ---
 
-## 5. Licenza
+## 5. License
 
-Distribuito con licenza open source per la conservazione e l'elaborazione dei file di scansione Hasselblad/Imacon Flextight.
+Released under an open-source license for archiving and processing Hasselblad/Imacon Flextight scanner files.
