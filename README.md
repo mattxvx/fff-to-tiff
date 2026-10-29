@@ -21,7 +21,7 @@ I parametri di sviluppo di FlexColor **non alterano i pixel grezzi**, ma vengono
 
 | Tag / Directory | Nome | Descrizione |
 |---|---|---|
-| `33723` | **IPTC** | Metadati IPTC standard (credit: *Soluzioni Arte*, data/ora scansione: 2026-02-04 17:13:25). |
+| `33723` | **IPTC** | Metadati IPTC standard. |
 | `34152` | **IPTC Copy** | Copia secondaria del blocco IPTC gestita da Imacon. |
 | `34377` | **Photoshop IRB** | Risorse immagine Photoshop (8BIM) contenenti IPTC e risoluzione. |
 | `46277` | **Imacon Scan Info** | Informazioni hardware e profili target (200.000 byte). |
