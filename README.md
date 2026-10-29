@@ -97,11 +97,14 @@ The converter is engineered for preservation workflows where data corruption, ac
 
 Archival master generation must guarantee under all circumstances that original `.fff` raw scans are never overwritten or mutated, even in the event of user error on the command line.
 
-#### Code Implementation ([`fff_to_tiff.py#L125-L133`](fff_to_tiff.py#L125-L133)):
+#### Code Implementation ([`fff_to_tiff.py#L134-L144`](fff_to_tiff.py#L134-L144)):
 ```python
 src = os.path.abspath(args.input)
 dst = os.path.abspath(args.output or os.path.splitext(src)[0] + '_negative_master.tif')
 
+# samefile() below raises FileNotFoundError on a missing source; fail clearly instead.
+if not os.path.isfile(src):
+    sys.exit(f'input not found: {src}')
 # Prevent overwriting the source file even when --force is passed.
 if src == dst or (os.path.exists(dst) and os.path.samefile(src, dst)):
     sys.exit(f'refusing to overwrite source file: {src}')
@@ -110,77 +113,76 @@ if os.path.exists(dst) and not args.force:
 ```
 
 #### How It Works:
-- **Path Canonicalization:** Both `src` and `dst` are resolved to absolute canonical paths using `os.path.abspath()`, neutralizing relative path tricks (such as `./scan.fff` vs `scan.fff` or `../folder/scan.fff`).
+- **Path Normalization:** Both `src` and `dst` are converted to absolute, normalized paths with `os.path.abspath()`, so spellings such as `./scan.fff`, `scan.fff` or `../folder/scan.fff` compare equal. `abspath()` does not resolve symbolic links; that case is handled by the identity check below.
+- **Source Existence Check:** `os.path.samefile()` calls `os.stat()` on both paths and raises `FileNotFoundError` if the source is missing. The explicit `os.path.isfile(src)` guard turns that case into a clean `input not found` exit instead of a traceback.
 - **Dual Identity Check:**
   1. String comparison (`src == dst`) catches direct name collisions.
-  2. Filesystem inode/device check (`os.path.samefile(src, dst)`) compares device numbers (`st_dev`) and inode/file index numbers (`st_ino`). This prevents overwrites via symbolic links, hard links, or Windows NTFS junctions/aliases.
-- **Strict Precedence over `--force`:** The collision check precedes the check for `args.force`. As a result, `--force` can overwrite a preexisting output file, but it will **never** force an overwrite of the source file.
-- **Read-Only Access:** The source file is opened exclusively with mode `'rb'` (`open(src, 'rb')`), guaranteeing that write buffers are never attached to the source descriptor.
+  2. `os.path.samefile(src, dst)` compares the device number (`st_dev`) and inode / NTFS file index (`st_ino`) of both paths. This catches aliases that differ as strings: symbolic links, hard links, junctions, and case-only differences on case-insensitive filesystems.
+- **Strict Precedence over `--force`:** The collision check runs before `args.force` is consulted. `--force` can replace a preexisting output file, but it can **never** target the source file.
+- **Read-Only Access:** The source file is only ever opened with mode `'rb'`, so no write handle to it is ever created.
 
 ---
 
 ### 4.2. Two-Tier Post-Write Verification
 
-Writing a compressed TIFF file involves predictive transforms and Deflate encoding. To guarantee that compression artifacts or library errors never alter pixel values or metadata, the script performs a mandatory two-tier validation on the newly written file before finalizing it.
+Writing a compressed TIFF involves a predictor transform and Deflate encoding. To guarantee that neither the encoder nor the TIFF writer alters pixel values or metadata, the newly written file is decoded again and checked against the source before it is promoted to its final name.
 
-#### Code Implementation ([`fff_to_tiff.py#L242-L280`](fff_to_tiff.py#L242-L280)):
+#### Code Implementation ([`fff_to_tiff.py#L260-L322`](fff_to_tiff.py#L260-L322)):
 ```python
-# --- verification ----------------------------------------------------------------
 with tifffile.TiffFile(tmp) as tf:
     page = tf.pages[0]
-    out = page.asarray()
     problems: list[str] = []
-    if out.shape != pixels.shape or out.dtype.itemsize != 2:
-        problems.append(f'shape/dtype mismatch {out.shape} {out.dtype}')
-    elif not np.array_equal(out, pixels):
-        problems.append('pixel data differs')
-    out_be = np.ascontiguousarray(out, dtype=bo + 'u2')
-    out_md5 = hashlib.md5(memoryview(out_be)).hexdigest()
-    if out_md5 != src_md5:
-        problems.append('pixel MD5 differs')
+    if page.shape != pixels.shape or page.dtype is None or page.dtype.itemsize != 2:
+        problems.append(f'shape/dtype mismatch {page.shape} {page.dtype}')
+    else:
+        md5 = hashlib.md5()
+        src_dtype = np.dtype(bo + 'u2')
+        pixels_equal = True
+        y = 0
+        for segment, index, shape in page.segments(
+            sort=True, buffersize=VERIFY_READ_BUFFER
+        ):
+            if segment is None:
+                problems.append(f'strip at row {y} could not be decoded')
+                break
+            rows = np.ascontiguousarray(segment.reshape(shape[-3:]), dtype=src_dtype)
+            n = rows.shape[0]
+            if index[-3] != y or y + n > height:
+                problems.append(f'unexpected strip layout at row {y}')
+                break
+            if pixels_equal and not np.array_equal(rows, pixels[y:y + n]):
+                pixels_equal = False
+            md5.update(rows)
+            y += n
+        else:
+            if y != height:
+                problems.append(f'decoded {y} rows, expected {height}')
+        if not pixels_equal:
+            problems.append('pixel data differs')
+        if md5.hexdigest() != src_md5:
+            problems.append('pixel MD5 differs')
     for code in COPY_TAGS:
-        if code in tags:
-            t_tag = page.tags.get(code)
-            if t_tag is None:
-                problems.append(f'tag {code} missing')
-                continue
-            val = t_tag.value
-            orig_typ, orig_cnt, orig_raw = tags[code]
-            if isinstance(val, (bytes, bytearray)):
-                got = bytes(val)
-            elif isinstance(val, str):
-                got = val.encode('latin1') + b'\x00'
-            else:
-                fmt = TIFF_TYPES[orig_typ][0]
-                vals = list(val) if isinstance(val, (tuple, list)) else [val]
-                got = struct.pack(bo + fmt * orig_cnt, *vals)
-            if got != orig_raw:
-                problems.append(f'tag {code} differs')
+        ...  # byte-for-byte tag comparison, see below
+if problems:
+    raise RuntimeError('VERIFICATION FAILED, output discarded: ' + '; '.join(problems))
 ```
 
 #### How It Works:
-- **Tier 1: Array-Level and In-Memory Comparison:**
-  - Reads back the written image using `tifffile.TiffFile(tmp).pages[0].asarray()`.
-  - Verifies matrix dimensions (`out.shape == pixels.shape`) and bit depth (`out.dtype.itemsize == 2`, corresponding to 16 bits per sample).
-  - Evaluates `np.array_equal(out, pixels)` across all samples (e.g., $7991 \times 10120 \times 3 \approx 242.6 \times 10^6$ values), ensuring zero difference in unpacked numerical representation.
-- **Tier 2: Cryptographic Payload Hash Matching:**
-  - Standardizes memory layout into a C-contiguous array in native file byte order (`np.ascontiguousarray(out, dtype=bo + 'u2')`).
-  - Calculates the MD5 digest over the raw pixel buffer via `hashlib.md5(memoryview(out_be)).hexdigest()`.
-  - Asserts that `out_md5 == src_md5`, where `src_md5` was computed directly from the source file strips prior to decompression.
-- **Private Metadata Tag Verification:**
-  - Iterates over all tags defined in `COPY_TAGS` (IPTC, Photoshop IRB, Imacon scan info, FlexColor settings plist `50457`, etc.).
-  - Serializes read-back tag values back to raw bytes according to TIFF type specifications (`struct.pack`) and checks them byte-for-byte against the original binary values (`got != orig_raw`).
-- **Failure Escalation:** Any discrepancy appends to `problems`, which aborts the process via `RuntimeError`, triggering the atomic cleanup handler.
+- **Structural Check:** The output page must report the same `(height, width, 3)` shape as the source and a 2-byte (16-bit) sample type before any pixel is compared.
+- **Strip-by-Strip Decoding:** Instead of `page.asarray()`, which materializes a second full-size image, the verifier iterates over `page.segments(sort=True)`. Each iteration yields one decoded strip (Deflate inflated, horizontal predictor undone) together with its position. The verifier checks that strips arrive contiguously (`index[-3] == y`), never overrun the image, decode successfully, and together cover exactly `height` rows.
+- **Tier 1 – Numerical Equality:** Each decoded strip is compared with the matching rows of the source array using `np.array_equal(rows, pixels[y:y + n])`. Across all strips this covers every sample of the image (e.g., $7991 \times 10120 \times 3 \approx 242.6 \times 10^6$ values).
+- **Tier 2 – Independent Hash of the Decoded Output:** tifffile decodes into the host's native byte order (little-endian on x86-64/ARM64), while `src_md5` was computed over the source bytes in the file's byte order (`bo`). Each strip is therefore converted to `bo + 'u2'` before being fed to a running `hashlib.md5()`. The final digest must equal `src_md5`, which was computed from the raw source strips before any NumPy processing.
+- **Private Metadata Tag Verification:** Every tag in `COPY_TAGS` present in the source (IPTC, Photoshop IRB, Imacon scan info, FlexColor settings plist `50457`, etc.) is read back, re-serialized to raw bytes according to its original TIFF type (`struct.pack`), and compared byte-for-byte with the source bytes (`got != orig_raw`). If a preserved tag has a TIFF type the parser does not understand, [`read_ifd0`](fff_to_tiff.py#L82-L86) raises an error instead of silently dropping it.
+- **Failure Escalation:** Any discrepancy is appended to `problems`, the run aborts with `RuntimeError`, and the cleanup handler (§4.3) deletes the staging file.
 
 ---
 
 ### 4.3. Atomic Writing and Failure Cleanup
 
-To prevent partial or corrupt files from remaining on disk during power loss, process termination, full disk errors, or verification failures, all file writes use atomic staging and cleanup semantics.
+The final output path must only ever contain a complete, verified master. All writes are staged in a temporary file that is promoted only after verification succeeds.
 
-#### Code Implementation ([`fff_to_tiff.py#L231-L290`](fff_to_tiff.py#L231-L290)):
+#### Code Implementation ([`fff_to_tiff.py#L248-L332`](fff_to_tiff.py#L248-L332)):
 ```python
-# --- write to a temporary file, verify, then rename ----------------------------------
 tmp = dst + '.partial'
 try:
     tifffile.imwrite(
@@ -192,7 +194,7 @@ try:
         datetime=datetime_str, extratags=extratags, metadata=None,
     )
 
-    # --- verification runs on tmp ---
+    # --- verification runs on tmp (§4.2) ---
     if problems:
         raise RuntimeError('VERIFICATION FAILED, output discarded: ' + '; '.join(problems))
     os.replace(tmp, dst)
@@ -208,13 +210,10 @@ except BaseException as exc:
 ```
 
 #### How It Works:
-- **Isolated Staging (`.partial`):** All output is written to a temporary sibling file `tmp = dst + '.partial'`. The target destination `dst` remains untouched and unmodified until the new file has completely passed verification.
-- **Atomic Promotion (`os.replace`):** Once verification succeeds, `os.replace(tmp, dst)` renames the staging file to the final destination. On POSIX systems and modern Windows NT systems (via `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`), this operation is atomic at the filesystem level. External processes will never observe an incomplete or half-written file.
-- **`BaseException` Cleanup Boundary:** The entire write and verification sequence is enclosed in a `try...except BaseException` block. Unlike standard `except Exception`, this captures:
-  - System aborts and interruptions (`KeyboardInterrupt` / Ctrl+C).
-  - Out-of-memory or out-of-disk exceptions (`OSError`).
-  - Verification rejections (`RuntimeError`).
-- **Orphan File Removal:** If any error is caught, `os.remove(tmp)` immediately purges the staging `.partial` file from disk, guaranteeing zero residue from failed runs.
+- **Isolated Staging (`.partial`):** All output is written to the sibling file `dst + '.partial'`. The destination `dst`, including any existing master being replaced with `--force`, is not touched until verification has passed.
+- **Single-Step Promotion (`os.replace`):** After verification, `os.replace(tmp, dst)` renames the staging file over the destination. Because the staging file sits in the same directory, this is a rename within one volume and never a copy. On POSIX this is `rename(2)`, which atomically replaces the target. On Windows, CPython uses `MoveFileExW(..., MOVEFILE_REPLACE_EXISTING)`. On NTFS this is a metadata-only rename in practice, although Windows does not formally document it as atomic.
+- **`BaseException` Cleanup Boundary:** The write and verification sequence is wrapped in `try...except BaseException`. Unlike `except Exception`, this also covers `KeyboardInterrupt` (Ctrl+C) and `SystemExit`, in addition to `MemoryError`, disk-full `OSError`s, and verification failures (`RuntimeError`). The `.partial` file is removed and the exception is re-raised. Verification failures are reported as a clean exit message.
+- **Limits:** Cleanup runs inside the Python process. A power loss, OS crash, or forced termination (`SIGKILL`, Task Manager "End task") can leave a stale `.partial` file behind. Even then, the final `*_negative_master.tif` is never left half-written, because it only appears after `os.replace` succeeds. Any `.partial` file found on disk is an unverified leftover and can be deleted.
 
 ---
 
@@ -224,7 +223,7 @@ TIFF containers can be encoded in either Motorola Big-Endian (`MM`) or Intel Lit
 
 #### Code Implementation:
 
-Header detection and dynamic IFD unpack ([`fff_to_tiff.py#L62-L87`](fff_to_tiff.py#L62-L87)):
+Header detection and dynamic IFD unpack ([`fff_to_tiff.py#L66-L94`](fff_to_tiff.py#L66-L94)):
 ```python
 def read_ifd0(path: str) -> tuple[str, dict[int, TagEntry]]:
     with open(path, 'rb') as f:
@@ -241,65 +240,82 @@ def read_ifd0(path: str) -> tuple[str, dict[int, TagEntry]]:
         # ... unpacked dynamically with format strings parameterized by bo ...
 ```
 
-Buffer reconstruction, writing, and verification ([`fff_to_tiff.py#L167`](fff_to_tiff.py#L167), [`#L234`](fff_to_tiff.py#L234), [`#L251`](fff_to_tiff.py#L251)):
+Buffer reconstruction, writing, and verification ([`fff_to_tiff.py#L185`](fff_to_tiff.py#L185), [`#L252`](fff_to_tiff.py#L252), [`#L272`](fff_to_tiff.py#L272), [`#L281`](fff_to_tiff.py#L281)):
 ```python
-# NumPy typed directly with the container's endianness:
+# NumPy view typed with the container's endianness:
 pixels = np.frombuffer(raw, dtype=bo + 'u2').reshape(height, width, 3)
 
 # Preserving container byte order during Deflate compression:
 tifffile.imwrite(tmp, pixels, byteorder=bo, ...)
 
-# Cross-platform hash alignment:
-out_be = np.ascontiguousarray(out, dtype=bo + 'u2')
-out_md5 = hashlib.md5(memoryview(out_be)).hexdigest()
+# Decoded strips (native byte order) converted back to the container byte order before hashing:
+src_dtype = np.dtype(bo + 'u2')
+rows = np.ascontiguousarray(segment.reshape(shape[-3:]), dtype=src_dtype)
 ```
 
 #### How It Works:
 - **Dynamic Header Parsing:** Inspects the first 2 bytes of the container: `b'MM'` sets `bo = '>'` (big-endian), and `b'II'` sets `bo = '<'` (little-endian).
-- **Parameterized Struct Unpacking:** All subsequent binary parsing throughout IFD directory entries parameterizes format strings with `bo` (e.g., `bo + 'HI'`, `bo + 'HHI'`, `bo + fmt * cnt`). Hardcoded endianness assumptions are avoided.
-- **Direct NumPy Endian Types:** Array buffers are mapped using `dtype=bo + 'u2'`, which indicates unsigned 16-bit integers (`uint16`) respecting the file's native byte order (`>u2` or `<u2`).
-- **Native Container Preservation:** When outputting the TIFF, `byteorder=bo` preserves the source file's original byte order, preventing unnecessary byte swapping.
-- **Deterministic Hashing:** Casting to `bo + 'u2'` before MD5 calculation guarantees that hash comparisons remain identical whether executed on x86-64 (little-endian), ARM64, or big-endian architectures.
+- **Parameterized Struct Unpacking:** All subsequent binary parsing of IFD entries builds its format strings from `bo` (e.g., `bo + 'HI'`, `bo + 'HHI'`, `bo + fmt * cnt`). There are no hardcoded endianness assumptions.
+- **Direct NumPy Endian Types:** The pixel buffer is interpreted with `dtype=bo + 'u2'`, i.e. unsigned 16-bit integers in the file's byte order (`>u2` or `<u2`).
+- **Native Container Preservation:** `byteorder=bo` writes the master in the same byte order as the source.
+- **Deterministic Hashing:** The source MD5 is taken over the bytes exactly as stored, and the verification MD5 is taken over decoded strips converted back to `bo + 'u2'`. Both digests describe the same byte sequence on any host architecture (x86-64, ARM64, or big-endian).
 
 ---
 
-### 4.5. Zero-Copy and Low Memory Footprint
+### 4.5. Memory Footprint
 
-A 4x5 sheet film scan at 2040 ppi yields an uncompressed frame of $7991 \times 10120 \times 3 \times 2 \approx 485.2\text{ MB}$. Naive image processing scripts frequently duplicate arrays during type conversion, hashing, and compression, creating memory spikes exceeding 2–3 GB that can crash systems with limited RAM.
+A 4x5 sheet film scan at 2040 ppi yields an uncompressed frame of $7991 \times 10120 \times 3 \times 2 \approx 485.2\text{ MB}$. The converter holds exactly **one** full-size copy of the pixel data (the source buffer) for the entire run. Every other stage works on bounded, strip-sized pieces.
+
+#### Measured Peak Memory
+
+Measured with `tracemalloc` (Python and NumPy heap allocations) converting the reference 7991 × 10120 scan (`01 001.fff`):
+
+| Phase | Before optimization | Current |
+|---|---|---|
+| Source read | 971 MB | 486 MB |
+| Compression / write | 550 MB | 552 MB |
+| Verification | 1596 MB | 538 MB |
+| **Overall peak** | **1596 MB** | **~552 MB** |
+
+Native allocations made inside zlib are not tracked by `tracemalloc`. They are small (a few hundred KB per compressor/decompressor stream).
 
 #### Code Implementation:
 
-Zero-copy ndarray instantiation ([`fff_to_tiff.py#L161-L167`](fff_to_tiff.py#L161-L167)):
+In-place source read ([`fff_to_tiff.py#L172-L185`](fff_to_tiff.py#L172-L185)):
 ```python
-# --- read source pixels (read-only) and hash the raw bytes exactly as stored ----------
-raw = bytearray()
-with open(src, 'rb') as f:
+raw = bytearray(expected)
+with open(src, 'rb') as f, memoryview(raw) as view:
+    pos = 0
     for o, c in zip(offsets, counts):
         f.seek(o)
-        raw += _read_exact(f, c)
+        n_read = f.readinto(view[pos:pos + c])
+        if n_read != c:
+            raise ValueError(f'unexpected EOF: expected {c} bytes, got {n_read}')
+        pos += c
 src_md5 = hashlib.md5(raw).hexdigest()
 pixels = np.frombuffer(raw, dtype=bo + 'u2').reshape(height, width, 3)
 ```
 
-Direct buffer hashing via `memoryview` ([`fff_to_tiff.py#L251-L252`](fff_to_tiff.py#L251-L252)):
+Bounded read-back buffer for verification ([`fff_to_tiff.py#L53-L55`](fff_to_tiff.py#L53-L55), [`#L275-L277`](fff_to_tiff.py#L275-L277)):
 ```python
-out_be = np.ascontiguousarray(out, dtype=bo + 'u2')
-out_md5 = hashlib.md5(memoryview(out_be)).hexdigest()
+VERIFY_READ_BUFFER = 8 << 20
+
+for segment, index, shape in page.segments(
+    sort=True, buffersize=VERIFY_READ_BUFFER
+):
 ```
 
-Striped compression streaming ([`fff_to_tiff.py#L236`](fff_to_tiff.py#L236)):
+Strip-wise compression ([`fff_to_tiff.py#L254`](fff_to_tiff.py#L254)):
 ```python
-tifffile.imwrite(
-    ...,
-    rowsperstrip=args.rows_per_strip,  # default: 64 rows
-    ...
-)
+tifffile.imwrite(..., rowsperstrip=args.rows_per_strip, ...)  # default: 64 rows
 ```
 
 #### How It Works:
-- **Zero-Copy View with `np.frombuffer`:** Rather than allocating a new memory buffer when parsing pixel data, `np.frombuffer(raw, dtype=bo + 'u2')` creates a NumPy ndarray wrapper directly over the existing byte buffer `raw`. The `reshape` operation is a metadata-only stride operation, resulting in $O(1)$ additional memory allocation.
-- **Zero-Copy Hashing with `memoryview`:** In standard Python, calculating the MD5 of a NumPy array requires calling `out.tobytes()`, which allocates another duplicate ~485 MB byte string on the Python heap. By using `memoryview(out_be)`, the script exposes the array's underlying C-contiguous buffer directly to OpenSSL's C-level hashing routines via the Python Buffer Protocol with **zero heap memory allocation**.
-- **Streaming Strip Compression:** Rather than encoding the entire ~485 MB image in one massive block, `rowsperstrip=64` divides the image into horizontal bands ($64 \times 7991 \times 3 \times 2 \approx 3.07\text{ MB}$ per strip). The Deflate compressor processes and flushes each strip sequentially, maintaining a predictable and low working memory ceiling throughout the compression phase.
+- **Preallocated, In-Place Read:** The exact pixel buffer size (`width × height × 3 × 2`) is known and validated from the strip byte counts before reading. A single `bytearray` of that size is allocated and filled with `readinto()` through a `memoryview` slice. Appending `bytes` objects (`raw += f.read(c)`) would briefly hold each strip twice. Because the Flextight writes the whole image as one strip, that doubled the memory used for reading (971 MB). A short read still raises `unexpected EOF`.
+- **Zero-Copy Array View:** `np.frombuffer(raw, dtype=bo + 'u2')` wraps the existing buffer without copying, and `reshape` only changes shape/stride metadata. The same buffer is hashed (`hashlib.md5(raw)`), compressed, and compared against, so it is never duplicated.
+- **Strip-Wise Compression:** With `rowsperstrip=64`, each strip is $64 \times 7991 \times 3 \times 2 \approx 3.07\text{ MB}$ of raw data, which is predicted and Deflate-compressed independently. The write phase adds only ~65 MB on top of the source buffer.
+- **Streaming Verification:** Decoding the output with `page.asarray()` would allocate a second ~485 MB image plus ~625 MB of transient decoder buffers. Instead, `page.segments()` decodes one strip at a time, and each strip is compared, byte-order-converted, and hashed before the next is decoded. `hashlib` accepts the strip array directly through the buffer protocol, so no `bytes` copy is made for hashing.
+- **Bounded Read-Back Buffer:** By default `segments()` reads compressed strip data in batches of several hundred MB. `buffersize=VERIFY_READ_BUFFER` (8 MiB) caps each batch, which reduced verification-phase temporaries from ~628 MB to ~48 MB in measurement.
 
 ---
 
@@ -318,6 +334,11 @@ Included test cases:
 4. `test_corrupt_flexcolor_plist_falls_back_gracefully`: Graceful degradation if metadata plist is malformed.
 5. `test_little_endian_conversion`: Validates little-endian (`<`) byte order handling and MD5 integrity.
 6. `test_partial_file_cleaned_up_on_failure`: Ensures incomplete `.partial` files are deleted on runtime exceptions.
+7. `test_missing_source_gives_clear_error`: A missing input exits with `input not found` (instead of a `samefile()` traceback) and leaves an existing destination untouched.
+8. `test_invalid_rows_per_strip_rejected`: `--rows-per-strip` values `0` and `-1` are rejected by argparse before any I/O.
+9. `test_preserved_tag_with_unknown_type_is_not_silently_dropped`: A `COPY_TAGS` entry with an undefined TIFF type aborts parsing instead of being skipped.
+10. `test_multi_strip_verification_roundtrip`: Strip-by-strip verification across multiple strips, including a partial last strip, in both byte orders.
+11. `test_verification_detects_corrupted_pixel`: A single flipped bit in the last strip fails both the equality and MD5 checks, and no output or `.partial` file remains.
 
 ---
 

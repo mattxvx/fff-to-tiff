@@ -50,6 +50,10 @@ COPY_TAGS: dict[int, str] = {
 
 TagEntry = tuple[int, int, bytes]
 
+# Compressed bytes tifffile reads per batch while streaming strips during verification.
+# Its default batches several hundred MB at once; 8 MiB keeps the decode phase small.
+VERIFY_READ_BUFFER = 8 << 20
+
 
 # Helper function to guard against truncated files or out-of-bounds seeks.
 def _read_exact(f: BinaryIO, size: int) -> bytes:
@@ -76,6 +80,9 @@ def read_ifd0(path: str) -> tuple[str, dict[int, TagEntry]]:
         for e in entries:
             tag, typ, cnt = struct.unpack(bo + 'HHI', e[:8])
             if typ not in TIFF_TYPES:
+                # Never silently drop a tag that must be preserved in the master.
+                if tag in COPY_TAGS:
+                    raise ValueError(f'unsupported TIFF type {typ} for preserved tag {tag}')
                 continue
             size = TIFF_TYPES[typ][1] * cnt
             if size <= 4:
@@ -121,10 +128,15 @@ def main() -> None:
     ap.add_argument('--force', action='store_true', help='overwrite an existing output file')
     ap.add_argument('--rows-per-strip', type=int, default=64)
     args = ap.parse_args()
+    if args.rows_per_strip < 1:
+        ap.error('--rows-per-strip must be >= 1')
 
     src = os.path.abspath(args.input)
     dst = os.path.abspath(args.output or os.path.splitext(src)[0] + '_negative_master.tif')
 
+    # samefile() below raises FileNotFoundError on a missing source; fail clearly instead.
+    if not os.path.isfile(src):
+        sys.exit(f'input not found: {src}')
     # Prevent overwriting the source file even when --force is passed.
     if src == dst or (os.path.exists(dst) and os.path.samefile(src, dst)):
         sys.exit(f'refusing to overwrite source file: {src}')
@@ -158,11 +170,17 @@ def main() -> None:
         sys.exit(f'strip byte counts {sum(counts)} != expected {expected}')
 
     # --- read source pixels (read-only) and hash the raw bytes exactly as stored ----------
-    raw = bytearray()
-    with open(src, 'rb') as f:
+    # Preallocate the exact pixel buffer and fill it in place with readinto(): appending
+    # `bytes` objects would briefly hold each strip twice (a full image for a single strip).
+    raw = bytearray(expected)
+    with open(src, 'rb') as f, memoryview(raw) as view:
+        pos = 0
         for o, c in zip(offsets, counts):
             f.seek(o)
-            raw += _read_exact(f, c)
+            n_read = f.readinto(view[pos:pos + c])
+            if n_read != c:
+                raise ValueError(f'unexpected EOF: expected {c} bytes, got {n_read}')
+            pos += c
     src_md5 = hashlib.md5(raw).hexdigest()
     pixels = np.frombuffer(raw, dtype=bo + 'u2').reshape(height, width, 3)
 
@@ -242,16 +260,40 @@ def main() -> None:
         # --- verification ----------------------------------------------------------------
         with tifffile.TiffFile(tmp) as tf:
             page = tf.pages[0]
-            out = page.asarray()
             problems: list[str] = []
-            if out.shape != pixels.shape or out.dtype.itemsize != 2:
-                problems.append(f'shape/dtype mismatch {out.shape} {out.dtype}')
-            elif not np.array_equal(out, pixels):
-                problems.append('pixel data differs')
-            out_be = np.ascontiguousarray(out, dtype=bo + 'u2')
-            out_md5 = hashlib.md5(memoryview(out_be)).hexdigest()
-            if out_md5 != src_md5:
-                problems.append('pixel MD5 differs')
+            if page.shape != pixels.shape or page.dtype is None or page.dtype.itemsize != 2:
+                problems.append(f'shape/dtype mismatch {page.shape} {page.dtype}')
+            else:
+                # Decode and check one strip at a time instead of page.asarray(), which would
+                # hold a second full-size image plus decoder buffers in memory. tifffile
+                # decodes to native byte order, so each strip is converted back to the source
+                # byte order `bo` before hashing, keeping the running MD5 comparable to src_md5.
+                md5 = hashlib.md5()
+                src_dtype = np.dtype(bo + 'u2')
+                pixels_equal = True
+                y = 0
+                for segment, index, shape in page.segments(
+                    sort=True, buffersize=VERIFY_READ_BUFFER
+                ):
+                    if segment is None:
+                        problems.append(f'strip at row {y} could not be decoded')
+                        break
+                    rows = np.ascontiguousarray(segment.reshape(shape[-3:]), dtype=src_dtype)
+                    n = rows.shape[0]
+                    if index[-3] != y or y + n > height:
+                        problems.append(f'unexpected strip layout at row {y}')
+                        break
+                    if pixels_equal and not np.array_equal(rows, pixels[y:y + n]):
+                        pixels_equal = False
+                    md5.update(rows)
+                    y += n
+                else:
+                    if y != height:
+                        problems.append(f'decoded {y} rows, expected {height}')
+                if not pixels_equal:
+                    problems.append('pixel data differs')
+                if md5.hexdigest() != src_md5:
+                    problems.append('pixel MD5 differs')
             for code in COPY_TAGS:
                 if code in tags:
                     t_tag = page.tags.get(code)
