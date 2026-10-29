@@ -1,5 +1,6 @@
 import plistlib
 import struct
+import tracemalloc
 from pathlib import Path
 import numpy as np
 import pytest
@@ -189,3 +190,82 @@ def test_verification_detects_corrupted_pixel(tmp_path: Path, monkeypatch: pytes
 
     assert not dst.exists()
     assert not (tmp_path / "out.tif.partial").exists()
+
+
+def _patch_ifd0_entry(path: Path, tag: int, *, value: int | None = None, count: int | None = None) -> None:
+    """Overwrite the count and/or value field of one IFD0 entry in a big-endian TIFF."""
+    data = bytearray(path.read_bytes())
+    ifd = struct.unpack('>I', data[4:8])[0]
+    for i in range(struct.unpack('>H', data[ifd:ifd + 2])[0]):
+        pos = ifd + 2 + 12 * i
+        if struct.unpack('>H', data[pos:pos + 2])[0] != tag:
+            continue
+        typ = struct.unpack('>H', data[pos + 2:pos + 4])[0]
+        if count is not None:
+            data[pos + 4:pos + 8] = struct.pack('>I', count)
+        if value is not None:
+            data[pos + 8:pos + 12] = struct.pack('>HH', value, 0) if typ == 3 else struct.pack('>I', value)
+        path.write_bytes(bytes(data))
+        return
+    pytest.fail(f"tag {tag} not found in {path}")
+
+
+def test_one_row_per_strip_verification(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that segments() row offsets match the verifier's expectation with one row per strip."""
+    src = tmp_path / "scan.fff"
+    dst = tmp_path / "out.tif"
+    pixels = np.arange(4 * 4 * 3, dtype='>u2').reshape(4, 4, 3)
+    tifffile.imwrite(src, pixels, byteorder='>', photometric='rgb', planarconfig='contig', compression=None)
+
+    monkeypatch.setattr("sys.argv", ["fff_to_tiff.py", str(src), "-o", str(dst), "--rows-per-strip", "1"])
+    fff_to_tiff.main()
+
+    with tifffile.TiffFile(dst) as tf:
+        assert len(tf.pages[0].dataoffsets) == 4
+        assert np.array_equal(tf.pages[0].asarray(), pixels)
+
+
+def test_directory_input_rejected(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Verify that a directory passed as input is reported as not a regular file."""
+    monkeypatch.setattr("sys.argv", ["fff_to_tiff.py", str(tmp_path), "-o", str(tmp_path / "out.tif")])
+    with pytest.raises(SystemExit, match="input is not a regular file"):
+        fff_to_tiff.main()
+
+
+def test_corrupt_strip_header_rejected_before_allocation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Verify that a header claiming a huge image is rejected against the file size, not allocated."""
+    src = tmp_path / "liar.fff"
+    tifffile.imwrite(src, np.zeros((4, 4, 3), dtype='>u2'), byteorder='>', photometric='rgb',
+                     planarconfig='contig', compression=None)
+    _patch_ifd0_entry(src, 256, value=20000)  # ImageWidth
+    _patch_ifd0_entry(src, 257, value=20000)  # ImageLength
+    _patch_ifd0_entry(src, 278, value=20000)  # RowsPerStrip
+    _patch_ifd0_entry(src, 279, value=20000 * 20000 * 6)  # StripByteCounts: 2.4 GB claimed
+
+    monkeypatch.setattr("sys.argv", ["fff_to_tiff.py", str(src), "-o", str(tmp_path / "out.tif")])
+    tracemalloc.start()
+    try:
+        with pytest.raises(SystemExit, match="extends past end of file"):
+            fff_to_tiff.main()
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 50_000_000
+
+
+def test_corrupt_tag_length_rejected_before_allocation(tmp_path: Path) -> None:
+    """Verify that a tag whose count points past EOF raises before reserving the claimed size."""
+    src = tmp_path / "scan.fff"
+    _make_synthetic_fff(src)
+    _patch_ifd0_entry(src, 50457, count=0x7FFFFFFF)  # ~2 GB claimed for the FlexColor plist
+
+    tracemalloc.start()
+    try:
+        with pytest.raises(ValueError, match="unexpected EOF"):
+            fff_to_tiff.read_ifd0(str(src))
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+    assert peak < 50_000_000

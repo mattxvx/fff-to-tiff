@@ -57,6 +57,11 @@ VERIFY_READ_BUFFER = 8 << 20
 
 # Helper function to guard against truncated files or out-of-bounds seeks.
 def _read_exact(f: BinaryIO, size: int) -> bytes:
+    # Check the bytes actually left in the file before reading: f.read(n) reserves n bytes
+    # up front, so a corrupt tag length could otherwise allocate gigabytes for a tiny file.
+    remaining = max(0, os.fstat(f.fileno()).st_size - f.tell())
+    if size > remaining:
+        raise ValueError(f'unexpected EOF: expected {size} bytes, got {remaining}')
     data = f.read(size)
     if len(data) != size:
         raise ValueError(f'unexpected EOF: expected {size} bytes, got {len(data)}')
@@ -135,8 +140,10 @@ def main() -> None:
     dst = os.path.abspath(args.output or os.path.splitext(src)[0] + '_negative_master.tif')
 
     # samefile() below raises FileNotFoundError on a missing source; fail clearly instead.
-    if not os.path.isfile(src):
+    if not os.path.exists(src):
         sys.exit(f'input not found: {src}')
+    if not os.path.isfile(src):
+        sys.exit(f'input is not a regular file: {src}')
     # Prevent overwriting the source file even when --force is passed.
     if src == dst or (os.path.exists(dst) and os.path.samefile(src, dst)):
         sys.exit(f'refusing to overwrite source file: {src}')
@@ -168,6 +175,12 @@ def main() -> None:
     expected = width * height * spp * 2
     if sum(counts) != expected:
         sys.exit(f'strip byte counts {sum(counts)} != expected {expected}')
+    # The header alone determines `expected`; check it against the real file size before
+    # allocating, so a corrupt header cannot request gigabytes for a tiny file.
+    src_size = os.path.getsize(src)
+    for o, c in zip(offsets, counts):
+        if o + c > src_size:
+            sys.exit(f'strip at offset {o} ({c} bytes) extends past end of file ({src_size} bytes)')
 
     # --- read source pixels (read-only) and hash the raw bytes exactly as stored ----------
     # Preallocate the exact pixel buffer and fill it in place with readinto(): appending
